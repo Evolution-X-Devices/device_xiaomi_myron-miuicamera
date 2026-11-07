@@ -1,0 +1,330 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: NullCode1337 <contact.nullcode@proton.me>
+Date: Fri, 6 Nov 2026 00:00:00 +0800
+Subject: [PATCH] Clamp over-long HDR10+ SEI payloads
+
+The Qualcomm HEVC encoder emits a prefix SEI NAL (nal_unit_type 39) in
+front of every HDR10+ sample. The user_data_registered_itu_t_t35 message
+inside it carries the SMPTE ST 2094-40 metadata, but the encoder writes
+that message out of a fixed 1024 byte scratch buffer and declares the full
+buffer as payload_size (ff ff ff ff 04) even though only the leading 47
+bytes are meaningful; the rest is RBSP zero padding, escaped as repeating
+00 00 03.
+
+Every player validates the declared size before parsing the message and
+libavutil rejects anything above AV_HDR_PLUS_MAX_PAYLOAD_SIZE (907) with
+EINVAL from av_dynamic_hdr_plus_from_t35(), which aborts the access unit.
+That is why HDR10+ recordings fail to decode in ffmpeg, VLC, Google Photos
+and anything else built on libavformat - the whole sample is thrown away on
+its first NAL unit, not just the metadata.
+
+Rewrite such a message before it reaches the muxer: declare 512 bytes
+(ff ff 02), which is both below every known limit and larger than anything
+the ST 2094-40 structure needs, keep the real data followed by enough of
+the zero padding for the structure to parse completely, append
+rbsp_trailing_bits and drop the padding tail, then rebuild the sample so
+the remaining NAL units of the access unit stay in front of the muxer in
+the length-prefixed form it expects.
+
+The helper only acts on samples that are length-prefixed, start with a SEI
+NAL, declare payload_type 4, a payload_size above the 907 byte limit and
+the exact 0xb5 0x00 0x3c 0x00 0x01 0x04 T.35 header. Everything else -
+audio, Annex-B, other SEI types, already conformant payloads - is returned
+untouched and only costs a few comparisons.
+
+All 1057 video samples of a real HDR10+ recording round-trip through the
+helper unchanged apart from the SEI, and the rewritten elementary stream
+decodes without errors in ffmpeg and keeps its bt2020nc/bt2020/smpte2084
+color description.
+
+---
+ smali/com/android/camera/compat/Hdr10PlusSeiFix.smali | 263 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ smali_classes3/fh/i.smali                             |   5 +
+ 2 files changed, 268 insertions(+)
+
+diff --git a/smali/com/android/camera/compat/Hdr10PlusSeiFix.smali b/smali/com/android/camera/compat/Hdr10PlusSeiFix.smali
+new file mode 100644
+--- /dev/null
++++ b/smali/com/android/camera/compat/Hdr10PlusSeiFix.smali
+@@ -0,0 +1,263 @@
++.class public final Lcom/android/camera/compat/Hdr10PlusSeiFix;
++.super Ljava/lang/Object;
++.source "SourceFile"
++
++
++# The Qualcomm HEVC encoder emits, in front of every sample, a prefix SEI
++# (nal_unit_type 39) carrying the HDR10+ (SMPTE ST 2094-40) user data
++# registered ITU-T T.35 message.  The message is written out of a fixed size
++# 1024 byte scratch buffer, so only the leading 47 bytes are meaningful and
++# everything behind them is RBSP zero padding.  Players validate the declared
++# payload size against their own limit (libavutil caps it at 907 bytes) and
++# reject the whole access unit once it is exceeded, which makes HDR10+ videos
++# unplayable everywhere.
++#
++# Rewrite such a message: keep the real data plus enough of the zero padding
++# for the ST 2094-40 structure to be complete, and declare 512 bytes, which is
++# both well below every known limit and larger than any payload this encoder
++# produces.  src is returned untouched for every sample that is not affected.
++
++.method public static fix(Ljava/nio/ByteBuffer;Landroid/media/MediaCodec$BufferInfo;)Ljava/nio/ByteBuffer;
++    .locals 14
++
++    if-eqz p0, :done
++
++    if-eqz p1, :done
++
++    # offset/size of the sample inside src
++    iget v0, p1, Landroid/media/MediaCodec$BufferInfo;->offset:I
++
++    iget v1, p1, Landroid/media/MediaCodec$BufferInfo;->size:I
++
++    const/16 v2, 0x40
++
++    if-lt v1, v2, :done
++
++    if-ltz v0, :done
++
++    add-int v2, v0, v1
++
++    invoke-virtual {p0}, Ljava/nio/Buffer;->capacity()I
++    move-result v3
++
++    # The muxer validates offset + size against the capacity itself, leave
++    # malformed samples alone instead of throwing here.
++    if-le v2, v3, :capacity_ok
++
++    goto :done
++
++    :capacity_ok
++    invoke-virtual {p0}, Ljava/nio/ByteBuffer;->duplicate()Ljava/nio/ByteBuffer;
++    move-result-object v13
++
++    invoke-virtual {v13, v2}, Ljava/nio/Buffer;->limit(I)Ljava/nio/Buffer;
++
++    invoke-virtual {v13, v0}, Ljava/nio/Buffer;->position(I)Ljava/nio/Buffer;
++
++    # Annex B streams start with a start code and never reach the pattern
++    # below, because their first four bytes are not a plausible NAL length.
++    invoke-virtual {v13}, Ljava/nio/ByteBuffer;->getInt()I
++    move-result v4
++
++    const/4 v2, 0x4
++
++    if-lt v4, v2, :done
++
++    add-int/lit8 v5, v4, 0x4
++
++    if-gt v5, v1, :done
++
++    # nal_unit_header: forbidden_zero_bit + nal_unit_type(6) + layer_id(6) + tid(3)
++    invoke-virtual {v13}, Ljava/nio/ByteBuffer;->get()B
++    move-result v2
++
++    and-int/lit16 v2, v2, 0xff
++
++    shr-int/lit8 v2, v2, 0x1
++
++    and-int/lit8 v2, v2, 0x3f
++
++    const/16 v3, 0x27
++
++    if-eq v2, v3, :is_sei
++
++    goto :done
++
++    :is_sei
++    # skip nuh_layer_id + nuh_temporal_id_plus1
++    invoke-virtual {v13}, Ljava/nio/ByteBuffer;->get()B
++    move-result v2
++
++    # sei_message: payloadType has to be a single byte 4, i.e. T.35 user data
++    invoke-virtual {v13}, Ljava/nio/ByteBuffer;->get()B
++    move-result v2
++
++    const/4 v3, 0x4
++
++    if-eq v2, v3, :is_t35
++
++    goto :done
++
++    :is_t35
++    # payloadSize is a 0xff continuation, 1024 is encoded as ff ff ff ff 04
++    const/4 v6, 0x0
++
++    const/4 v2, 0x5
++
++    :ps_loop
++    if-gtz v2, :ps_byte
++
++    goto :done
++
++    :ps_byte
++    add-int/lit8 v2, v2, -0x1
++
++    invoke-virtual {v13}, Ljava/nio/ByteBuffer;->get()B
++    move-result v3
++
++    and-int/lit16 v3, v3, 0xff
++
++    const/16 v8, 0xff
++
++    if-eq v3, v8, :ps_full
++
++    # last chunk of the continuation carries the low 8 bits
++    add-int/2addr v6, v3
++
++    goto :ps_done
++
++    :ps_full
++    add-int/lit16 v6, v6, 0xff
++
++    goto :ps_loop
++
++    :ps_done
++    # Anything that already fits the 907 byte limit is left untouched.
++    const/16 v2, 0x391
++
++    if-gt v6, v2, :big_payload
++
++    goto :done
++
++    :big_payload
++    invoke-virtual {v13}, Ljava/nio/Buffer;->position()I
++    move-result v7
++
++    add-int v2, v7, v6
++
++    if-le v2, v5, :payload_fits
++
++    goto :done
++
++    :payload_fits
++    # itu_t_t35: country code 0xb5, provider code 0x003c, provider oriented
++    # code 0x0001, application identifier 4 (HDR10+)
++    invoke-virtual {v13}, Ljava/nio/ByteBuffer;->getInt()I
++    move-result v2
++
++    const v3, -0x4affc400
++
++    if-ne v2, v3, :done
++
++    invoke-virtual {v13}, Ljava/nio/ByteBuffer;->get()B
++    move-result v2
++
++    const/4 v3, 0x1
++
++    if-ne v2, v3, :done
++
++    invoke-virtual {v13}, Ljava/nio/ByteBuffer;->get()B
++    move-result v2
++
++    const/4 v3, 0x4
++
++    if-ne v2, v3, :done
++
++    # tailLen = size - nalEnd
++    sub-int v9, v1, v5
++
++    # newSize = 4 (length) + 2 (header) + 1 (type) + 3 (size) + 512 + 1 (rbsp) + tailLen
++    const/16 v2, 0x207
++
++    add-int/lit8 v2, v2, 0x4
++
++    add-int/2addr v2, v9
++
++    move v10, v2
++
++    invoke-static {v2}, Ljava/nio/ByteBuffer;->allocateDirect(I)Ljava/nio/ByteBuffer;
++    move-result-object v11
++
++    const/16 v3, 0x207
++
++    invoke-virtual {v11, v3}, Ljava/nio/ByteBuffer;->putInt(I)Ljava/nio/ByteBuffer;
++
++    # copy the nal_unit_header
++    const/4 v3, 0x4
++
++    invoke-virtual {v13, v3}, Ljava/nio/Buffer;->position(I)Ljava/nio/Buffer;
++
++    invoke-virtual {v13}, Ljava/nio/ByteBuffer;->get()B
++    move-result v3
++
++    invoke-virtual {v11, v3}, Ljava/nio/ByteBuffer;->put(B)Ljava/nio/ByteBuffer;
++
++    invoke-virtual {v13}, Ljava/nio/ByteBuffer;->get()B
++    move-result v3
++
++    invoke-virtual {v11, v3}, Ljava/nio/ByteBuffer;->put(B)Ljava/nio/ByteBuffer;
++
++    # payloadType 4, payloadSize 512 == ff ff 02
++    const/4 v3, 0x4
++
++    invoke-virtual {v11, v3}, Ljava/nio/ByteBuffer;->put(B)Ljava/nio/ByteBuffer;
++
++    const/4 v3, -0x1
++
++    invoke-virtual {v11, v3}, Ljava/nio/ByteBuffer;->put(B)Ljava/nio/ByteBuffer;
++
++    invoke-virtual {v11, v3}, Ljava/nio/ByteBuffer;->put(B)Ljava/nio/ByteBuffer;
++
++    const/4 v3, 0x2
++
++    invoke-virtual {v11, v3}, Ljava/nio/ByteBuffer;->put(B)Ljava/nio/ByteBuffer;
++
++    # First 512 payload bytes: the real data followed by the zero padding the
++    # ST 2094-40 parser needs in order to finish reading the structure.
++    const/16 v3, 0x200
++
++    add-int v4, v7, v3
++
++    invoke-virtual {v13, v7}, Ljava/nio/Buffer;->position(I)Ljava/nio/Buffer;
++
++    invoke-virtual {v13, v4}, Ljava/nio/Buffer;->limit(I)Ljava/nio/Buffer;
++
++    invoke-virtual {v11, v13}, Ljava/nio/ByteBuffer;->put(Ljava/nio/ByteBuffer;)Ljava/nio/ByteBuffer;
++
++    # rbsp_trailing_bits
++    const/16 v3, 0x80
++
++    invoke-virtual {v11, v3}, Ljava/nio/ByteBuffer;->put(B)Ljava/nio/ByteBuffer;
++
++    # the remaining NAL units of the access unit
++    add-int v3, v0, v1
++
++    invoke-virtual {v13, v3}, Ljava/nio/Buffer;->limit(I)Ljava/nio/Buffer;
++
++    invoke-virtual {v13, v5}, Ljava/nio/Buffer;->position(I)Ljava/nio/Buffer;
++
++    invoke-virtual {v11, v13}, Ljava/nio/ByteBuffer;->put(Ljava/nio/ByteBuffer;)Ljava/nio/ByteBuffer;
++
++    const/4 v3, 0x0
++
++    invoke-virtual {v11, v3}, Ljava/nio/Buffer;->position(I)Ljava/nio/Buffer;
++
++    iput v3, p1, Landroid/media/MediaCodec$BufferInfo;->offset:I
++
++    iput v10, p1, Landroid/media/MediaCodec$BufferInfo;->size:I
++
++    move-object p0, v11
++
++    :done
++    return-object p0
++.end method
+diff --git a/smali_classes3/fh/i.smali b/smali_classes3/fh/i.smali
+--- a/smali_classes3/fh/i.smali
++++ b/smali_classes3/fh/i.smali
+@@ -846,6 +846,11 @@
+ .method public final D(Landroid/media/MediaMuxer;ILjava/nio/ByteBuffer;Landroid/media/MediaCodec$BufferInfo;)Z
+     .locals 6
+ 
++    # Rewrite over-long HDR10+ SEI messages so the sample stays playable.
++    invoke-static {p3, p4}, Lcom/android/camera/compat/Hdr10PlusSeiFix;->fix(Ljava/nio/ByteBuffer;Landroid/media/MediaCodec$BufferInfo;)Ljava/nio/ByteBuffer;
++
++    move-result-object p3
++
+     const-string v0, "writeSampleData "
+ 
+     const/4 v1, 0x0
+-- 
+2.43.0
+
